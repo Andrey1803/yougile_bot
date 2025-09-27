@@ -1,4 +1,7 @@
-aiogram==3.0.0b7
-fastapi==0.110.0
-uvicorn==0.29.0
-requests==2.31.0
+aiogram>=3.4.0
+aiohttp>=3.9.5
+uvloop; sys_platform == "linux"
+python-dotenv>=1.0.1
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
