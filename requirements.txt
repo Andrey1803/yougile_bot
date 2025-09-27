@@ -1,0 +1,4 @@
+aiogram==3.0.0b7
+fastapi==0.110.0
+uvicorn==0.29.0
+requests==2.31.0
