@@ -17,9 +17,7 @@ import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 
-# === Инициализация папки data и файлов ===
 os.makedirs("data", exist_ok=True)
-
 USER_FILE = "data/users.json"
 ORDER_LOG = "data/orders.log"
 
@@ -31,18 +29,15 @@ if not os.path.exists(ORDER_LOG):
     with open(ORDER_LOG, "w", encoding="utf-8") as f:
         f.write("")
 
-# === Инициализация бота ===
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# === FSM ===
 class OrderForm(StatesGroup):
     name = State()
     phone = State()
     address = State()
     comment = State()
 
-# === Клавиатуры ===
 def main_menu_kb():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🧾 Сделать заказ")]],
@@ -55,12 +50,10 @@ def cancel_kb():
         resize_keyboard=True
     )
 
-# === Валидация телефона ===
 def phone_is_valid(phone: str) -> bool:
     digits = re.sub(r"\D", "", phone)
     return 10 <= len(digits) <= 14
 
-# === Работа с пользователями ===
 def load_users():
     if os.path.exists(USER_FILE):
         with open(USER_FILE, "r", encoding="utf-8") as f:
@@ -73,12 +66,14 @@ def save_users(users):
 
 user_joined = load_users()
 
-# === Хендлеры ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = str(message.from_user.id)
     if user_id not in user_joined:
-        user_joined[user_id] = datetime.now().isoformat()
+        user_joined[user_id] = {
+            "joined": datetime.now().isoformat(),
+            "username": message.from_user.username
+        }
         save_users(user_joined)
     await message.answer(
         "Привет! Я приму ваш заказ и передам менеджеру.\n"
@@ -97,15 +92,12 @@ async def list_users(message: types.Message):
         await message.answer("👥 Пока никто не подключился к боту.")
         return
 
-    sorted_users = sorted(users.items(), key=lambda x: x[1])
+    sorted_users = sorted(users.items(), key=lambda x: x[1]["joined"])
     text = f"👥 Всего пользователей: <b>{len(users)}</b>\n\n"
 
-    for uid, joined in sorted_users:
-        try:
-            user = await bot.get_chat(int(uid))
-            name = user.full_name
-        except:
-            name = "❓ Неизвестно"
+    for uid, data in sorted_users:
+        name = data.get("username", "❓ Неизвестно")
+        joined = data["joined"]
         text += f"• <b>{name}</b>\n  ID: <code>{uid}</code>\n  Дата: {joined}\n\n"
 
     await message.answer(text)
@@ -180,23 +172,21 @@ async def process_comment(message: types.Message, state: FSMContext):
 
     await state.clear()
 
-# === Напоминания ===
 async def reminder_loop():
     while True:
         now = datetime.now()
-        for user_id, joined_at_str in user_joined.items():
-            joined_at = datetime.fromisoformat(joined_at_str)
+        for user_id, user_data in user_joined.items():
+            joined_at = datetime.fromisoformat(user_data["joined"])
             if now - joined_at >= timedelta(days=180):
                 await bot.send_message(
                     int(user_id),
                     "🔧 🔔 Уже 6 месяцев с момента последнего обслуживания. "
                     "Чтобы всё работало как часы, рекомендуем записаться на проверку."
                 )
-                user_joined[user_id] = now.isoformat()
+                user_data["joined"] = now.isoformat()
                 save_users(user_joined)
         await asyncio.sleep(10)
 
-# === FastAPI ===
 app = FastAPI()
 
 @app.post("/yougile/webhook")
@@ -205,7 +195,6 @@ async def yougile_webhook(request: Request):
     await bot.send_message(ADMIN_ID, f"Новое событие из YouGile:\n{data}")
     return {"status": "ok"}
 
-# === Запуск ===
 async def main():
     asyncio.create_task(reminder_loop())
 
