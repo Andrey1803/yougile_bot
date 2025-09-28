@@ -92,12 +92,22 @@ async def list_users(message: types.Message):
         await message.answer("👥 Пока никто не подключился к боту.")
         return
 
-    sorted_users = sorted(users.items(), key=lambda x: x[1]["joined"])
+    # Универсальная функция для получения даты
+    def get_joined(data):
+        if isinstance(data, dict):
+            return data.get("joined", "1970-01-01T00:00:00")
+        return data  # старый формат (строка)
+
+    sorted_users = sorted(users.items(), key=lambda x: get_joined(x[1]))
     text = f"👥 Всего пользователей: <b>{len(users)}</b>\n\n"
 
     for uid, data in sorted_users:
-        name = data.get("username", "❓ Неизвестно")
-        joined = data["joined"]
+        if isinstance(data, dict):
+            name = data.get("username", "❓ Неизвестно")
+            joined = data.get("joined", "—")
+        else:
+            name = "❓ Старый формат"
+            joined = data
         text += f"• <b>{name}</b>\n  ID: <code>{uid}</code>\n  Дата: {joined}\n\n"
 
     await message.answer(text)
@@ -175,7 +185,13 @@ async def process_comment(message: types.Message, state: FSMContext):
 async def reminder_loop():
     while True:
         now = datetime.now()
-        for user_id, user_data in user_joined.items():
+        for user_id, user_data in list(user_joined.items()):
+            # Конвертация старого формата (строка → словарь)
+            if isinstance(user_data, str):
+                user_data = {"joined": user_data, "username": None}
+                user_joined[user_id] = user_data
+                save_users(user_joined)
+
             joined_at = datetime.fromisoformat(user_data["joined"])
             if now - joined_at >= timedelta(days=180):
                 await bot.send_message(
