@@ -92,7 +92,6 @@ async def list_users(message: types.Message):
         await message.answer("👥 Пока никто не подключился к боту.")
         return
 
-    # Универсальная функция для получения даты
     def get_joined(data):
         if isinstance(data, dict):
             return data.get("joined", "1970-01-01T00:00:00")
@@ -186,10 +185,15 @@ async def reminder_loop():
     while True:
         now = datetime.now()
         for user_id, user_data in list(user_joined.items()):
-            # Конвертация старого формата (строка → словарь)
+            # Старый формат (строка)
             if isinstance(user_data, str):
                 user_data = {"joined": user_data, "username": None}
                 user_joined[user_id] = user_data
+                save_users(user_joined)
+
+            # Неполный словарь (нет joined)
+            if isinstance(user_data, dict) and "joined" not in user_data:
+                user_data["joined"] = datetime.now().isoformat()
                 save_users(user_joined)
 
             joined_at = datetime.fromisoformat(user_data["joined"])
