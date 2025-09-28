@@ -20,22 +20,22 @@ logging.basicConfig(level=logging.INFO)
 # === Инициализация папки data и файлов ===
 os.makedirs("data", exist_ok=True)
 
-if not os.path.exists("data/users.json"):
-    with open("data/users.json", "w", encoding="utf-8") as f:
+USER_FILE = "data/users.json"
+ORDER_LOG = "data/orders.log"
+
+if not os.path.exists(USER_FILE):
+    with open(USER_FILE, "w", encoding="utf-8") as f:
         json.dump({}, f, ensure_ascii=False, indent=2)
 
-if not os.path.exists("data/orders.log"):
-    with open("data/orders.log", "w", encoding="utf-8") as f:
+if not os.path.exists(ORDER_LOG):
+    with open(ORDER_LOG, "w", encoding="utf-8") as f:
         f.write("")
 
 # === Инициализация бота ===
-bot = Bot(
-    token=API_TOKEN,
-    default=DefaultBotProperties(parse_mode="HTML")
-)
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# === FSM для заказов ===
+# === FSM ===
 class OrderForm(StatesGroup):
     name = State()
     phone = State()
@@ -60,9 +60,7 @@ def phone_is_valid(phone: str) -> bool:
     digits = re.sub(r"\D", "", phone)
     return 10 <= len(digits) <= 14
 
-# === Хранилище пользователей ===
-USER_FILE = "data/users.json"
-
+# === Работа с пользователями ===
 def load_users():
     if os.path.exists(USER_FILE):
         with open(USER_FILE, "r", encoding="utf-8") as f:
@@ -75,7 +73,7 @@ def save_users(users):
 
 user_joined = load_users()
 
-# === Хендлеры бота ===
+# === Хендлеры ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = str(message.from_user.id)
@@ -87,6 +85,30 @@ async def cmd_start(message: types.Message):
         "Нажмите «🧾 Сделать заказ», чтобы оформить.",
         reply_markup=main_menu_kb()
     )
+
+@dp.message(Command("users"))
+async def list_users(message: types.Message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        await message.answer("⛔ Только админ может просматривать список.")
+        return
+
+    users = load_users()
+    if not users:
+        await message.answer("👥 Пока никто не подключился к боту.")
+        return
+
+    sorted_users = sorted(users.items(), key=lambda x: x[1])
+    text = f"👥 Всего пользователей: <b>{len(users)}</b>\n\n"
+
+    for uid, joined in sorted_users:
+        try:
+            user = await bot.get_chat(int(uid))
+            name = user.full_name
+        except:
+            name = "❓ Неизвестно"
+        text += f"• <b>{name}</b>\n  ID: <code>{uid}</code>\n  Дата: {joined}\n\n"
+
+    await message.answer(text)
 
 @dp.message(F.text == "🧾 Сделать заказ")
 async def start_order(message: types.Message, state: FSMContext):
@@ -134,14 +156,11 @@ async def process_comment(message: types.Message, state: FSMContext):
         f"🆔 Клиент: {message.from_user.full_name} (id: {message.from_user.id})"
     )
 
-    # Отправляем админу
     await bot.send_message(ADMIN_ID, summary)
 
-    # Логируем
-    with open("data/orders.log", "a", encoding="utf-8") as f:
+    with open(ORDER_LOG, "a", encoding="utf-8") as f:
         f.write(summary + "\n\n")
 
-    # === Создание задачи в YouGile ===
     try:
         task = create_task(
             title=f"Заказ от {data['name']}",
@@ -177,7 +196,7 @@ async def reminder_loop():
                 save_users(user_joined)
         await asyncio.sleep(10)
 
-# === FastAPI для YouGile ===
+# === FastAPI ===
 app = FastAPI()
 
 @app.post("/yougile/webhook")
@@ -189,12 +208,14 @@ async def yougile_webhook(request: Request):
 # === Запуск ===
 async def main():
     asyncio.create_task(reminder_loop())
-    loop = asyncio.get_event_loop()
-    loop.create_task(dp.start_polling(bot))
 
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
     server = uvicorn.Server(config)
-    await server.serve()
+
+    await asyncio.gather(
+        dp.start_polling(bot),
+        server.serve()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
