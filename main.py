@@ -72,8 +72,7 @@ async def cmd_start(message: types.Message):
     if user_id not in user_joined:
         user_joined[user_id] = {
             "joined": datetime.now().isoformat(),
-            "username": message.from_user.username,
-            "full_name": message.from_user.full_name
+            "username": message.from_user.username
         }
         save_users(user_joined)
     await message.answer(
@@ -103,21 +102,12 @@ async def list_users(message: types.Message):
 
     for uid, data in sorted_users:
         if isinstance(data, dict):
-            username = data.get("username")
-            full_name = data.get("full_name", "")
+            name = data.get("username", "❓ Неизвестно")
             joined = data.get("joined", "—")
-
-            if username:
-                name_display = f"@{username}"
-            elif full_name:
-                name_display = full_name
-            else:
-                name_display = "❓ Неизвестно"
         else:
-            name_display = "❓ Старый формат"
+            name = "❓ Старый формат"
             joined = data
-
-        text += f"• <b>{name_display}</b>\n  ID: <code>{uid}</code>\n  Дата: {joined}\n\n"
+        text += f"• <b>{name}</b>\n ID: <code>{uid}</code>\n Дата: {joined}\n\n"
 
     await message.answer(text)
 
@@ -196,7 +186,7 @@ async def reminder_loop():
         now = datetime.now()
         for user_id, user_data in list(user_joined.items()):
             if isinstance(user_data, str):
-                user_data = {"joined": user_data, "username": None, "full_name": ""}
+                user_data = {"joined": user_data, "username": None}
                 user_joined[user_id] = user_data
                 save_users(user_joined)
 
