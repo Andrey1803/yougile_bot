@@ -55,10 +55,12 @@ def phone_is_valid(phone: str) -> bool:
     return 10 <= len(digits) <= 14
 
 def load_users():
-    if os.path.exists(USER_FILE):
+    try:
         with open(USER_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {}
+    except Exception as e:
+        logging.warning(f"⚠️ Ошибка при загрузке users.json: {e}")
+        return {}
 
 def save_users(users):
     with open(USER_FILE, "w", encoding="utf-8") as f:
@@ -66,15 +68,25 @@ def save_users(users):
 
 user_joined = load_users()
 
+# 🔧 Миграция старого формата
+for uid, data in list(user_joined.items()):
+    if isinstance(data, str):
+        user_joined[uid] = {
+            "joined": data,
+            "username": None,
+            "full_name": None
+        }
+save_users(user_joined)
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = str(message.from_user.id)
-    if user_id not in user_joined:
-        user_joined[user_id] = {
-            "joined": datetime.now().isoformat(),
-            "username": message.from_user.username
-        }
-        save_users(user_joined)
+    user_joined[user_id] = {
+        "joined": datetime.now().isoformat(),
+        "username": message.from_user.username,
+        "full_name": message.from_user.full_name
+    }
+    save_users(user_joined)
     await message.answer(
         "Привет! Я приму ваш заказ и передам менеджеру.\n"
         "Нажмите «🧾 Сделать заказ», чтобы оформить.",
@@ -102,12 +114,21 @@ async def list_users(message: types.Message):
 
     for uid, data in sorted_users:
         if isinstance(data, dict):
-            name = data.get("username", "❓ Неизвестно")
+            username = data.get("username")
+            full_name = data.get("full_name")
             joined = data.get("joined", "—")
+
+            if username:
+                name_display = f"@{username}"
+            elif full_name:
+                name_display = full_name
+            else:
+                name_display = "❓ Неизвестно"
         else:
-            name = "❓ Старый формат"
+            name_display = "❓ Старый формат"
             joined = data
-        text += f"• <b>{name}</b>\n ID: <code>{uid}</code>\n Дата: {joined}\n\n"
+
+        text += f"• <b>{name_display}</b>\n  ID: <code>{uid}</code>\n  Дата: {joined}\n\n"
 
     await message.answer(text)
 
@@ -174,6 +195,7 @@ async def process_comment(message: types.Message, state: FSMContext):
             reply_markup=main_menu_kb()
         )
     except Exception as e:
+        logging.exception("❌ Ошибка при создании задачи в YouGile")
         await message.answer(
             f"⚠️ Заказ принят, но не удалось создать задачу в YouGile.\nОшибка: {e}",
             reply_markup=main_menu_kb()
@@ -186,7 +208,7 @@ async def reminder_loop():
         now = datetime.now()
         for user_id, user_data in list(user_joined.items()):
             if isinstance(user_data, str):
-                user_data = {"joined": user_data, "username": None}
+                user_data = {"joined": user_data, "username": None, "full_name": None}
                 user_joined[user_id] = user_data
                 save_users(user_joined)
 
@@ -214,6 +236,8 @@ async def yougile_webhook(request: Request):
     return {"status": "ok"}
 
 async def main():
+    logging.info("✅ Бот запускается: Telegram + FastAPI")
+
     asyncio.create_task(reminder_loop())
 
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
