@@ -21,10 +21,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 
-from config import API_TOKEN, ADMIN_ID, YOUGILE_WEBHOOK_SECRET
+from config import API_TOKEN, ADMIN_ID, YOUGILE_WEBHOOK_SECRET, DISPATCHER_INBOUND_API_KEY
 from tools.yougile_api import create_task, search_tasks_by_user, get_tasks_for_stats, get_column_name
 from tools.dispatcher_api import (
     describe_dispatcher_config,
+    dispatcher_inbound_record_id,
     dispatcher_inbound_ready,
     format_dispatcher_result_for_admin,
     ping_dispatcher_integration,
@@ -578,7 +579,7 @@ async def _notify_admin_dispatcher_result(disp: dict, *, context: str) -> None:
     """Уведомить админа о любом исходе (в т.ч. skipped — раньше молчали)."""
     if ADMIN_ID is None:
         return
-    if disp.get("ok") and disp.get("taskId"):
+    if disp.get("ok") and dispatcher_inbound_record_id(disp):
         return
     try:
         await bot.send_message(
@@ -1418,13 +1419,16 @@ async def confirm_repeat_order(message: types.Message):
     await _notify_admin_dispatcher_result(disp, context="🔄 Повторный заказ")
 
     lines = ["✅ Повторный заказ принят!"]
-    if disp.get("ok") and disp.get("taskId"):
-        lines.append(f"📋 Диспетчер: <code>{disp['taskId']}</code>")
+    if disp.get("ok") and dispatcher_inbound_record_id(disp):
+        if disp.get("leadId"):
+            lines.append(f"📥 Диспетчер (заявка): <code>{disp['leadId']}</code>")
+        else:
+            lines.append(f"📋 Диспетчер: <code>{disp['taskId']}</code>")
         _dg = disp.get("groupId")
         if _dg:
-            lines.append(f"📂 Группа в Диспетчере (id): <code>{_dg}</code> — откройте её; иначе задача в другой бригаде.")
+            lines.append(f"📂 Группа в Диспетчере (id): <code>{_dg}</code> — откройте вкладку «Заявки» в этой группе.")
     elif not disp.get("skipped"):
-        lines.append("⚠️ Диспетчер: не удалось создать задачу (проверьте логи и .env).")
+        lines.append("⚠️ Диспетчер: не удалось создать заявку (проверьте логи и .env).")
     if task.get("id"):
         lines.append(f"📋 YouGile: <code>{task['id']}</code>")
     elif yougile_err:
@@ -1617,13 +1621,16 @@ async def finalize_order(message: types.Message, state: FSMContext):
         await update_user_field(user_id, "last_order_id", task.get("id", "—"))
 
     lines = ["✅ Спасибо! Ваш заказ принят."]
-    if disp.get("ok") and disp.get("taskId"):
-        lines.append(f"📋 Диспетчер задач: <code>{disp['taskId']}</code>")
+    if disp.get("ok") and dispatcher_inbound_record_id(disp):
+        if disp.get("leadId"):
+            lines.append(f"📥 Диспетчер задач (заявка): <code>{disp['leadId']}</code>")
+        else:
+            lines.append(f"📋 Диспетчер задач: <code>{disp['taskId']}</code>")
         _dg = disp.get("groupId")
         if _dg:
-            lines.append(f"📂 Группа в Диспетчере (id): <code>{_dg}</code> — откройте её; иначе задача в другой бригаде.")
+            lines.append(f"📂 Группа в Диспетчере (id): <code>{_dg}</code> — откройте вкладку «Заявки» в этой группе.")
     elif not disp.get("skipped"):
-        lines.append("⚠️ Диспетчер: задача не создана (проверьте DISPATCHER_* на сервере бота и API).")
+        lines.append("⚠️ Диспетчер: заявка не создана (проверьте DISPATCHER_* на сервере бота и API).")
     if task.get("id"):
         lines.append(f"📋 YouGile: <code>{task['id']}</code>")
         lines.append(f"📝 Название: {task.get('title', '—')}")
@@ -2394,6 +2401,26 @@ async def yougile_webhook(request: Request):
             logger.error(f"Не удалось отправить событие: {e}")
 
     return {"status": "ok"}
+
+
+@app.post("/dispatcher/leads-alert")
+async def dispatcher_leads_alert(request: Request):
+    """Вебхук от API диспетчера: напоминания по «висящим» заявкам → админу в Telegram."""
+    if DISPATCHER_INBOUND_API_KEY:
+        auth = request.headers.get("Authorization") or ""
+        if not auth.startswith("Bearer ") or auth[7:].strip() != DISPATCHER_INBOUND_API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    text = str(data.get("text") or "").strip()
+    if ADMIN_ID is not None and text:
+        try:
+            await bot.send_message(ADMIN_ID, text)
+        except Exception as e:
+            logger.error("Не удалось отправить leads-alert админу: %s", e)
+    return {"ok": True}
 
 
 @app.get("/health")
