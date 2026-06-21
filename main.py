@@ -2454,6 +2454,51 @@ async def dispatcher_leads_alert(request: Request):
     return {"ok": True}
 
 
+def _phone_digits(phone: str) -> str:
+    return re.sub(r"\D", "", phone or "")
+
+
+def _telegram_user_id_by_phone(users: dict, phone: str) -> str | None:
+    digits = _phone_digits(phone)
+    if not digits or len(digits) < 6:
+        return None
+    for uid, data in users.items():
+        if _phone_digits(str((data or {}).get("phone") or "")) == digits:
+            return str(uid)
+    return None
+
+
+@app.post("/dispatcher/customer-notify")
+async def dispatcher_customer_notify(request: Request):
+    """Вебхук от API диспетчера: уведомление клиенту о стадии заявки."""
+    if DISPATCHER_INBOUND_API_KEY:
+        auth = request.headers.get("Authorization") or ""
+        if not auth.startswith("Bearer ") or auth[7:].strip() != DISPATCHER_INBOUND_API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty_text"}
+    tg_raw = str(data.get("telegramUserId") or data.get("telegram_user_id") or "").strip()
+    phone = str(data.get("phone") or "").strip()
+    target_id = tg_raw if tg_raw.isdigit() else None
+    if not target_id and phone:
+        users = await load_users()
+        target_id = _telegram_user_id_by_phone(users, phone)
+    if not target_id:
+        logger.info("customer-notify: получатель не найден (phone=%s tg=%s)", phone[:6] if phone else "", tg_raw[:6] if tg_raw else "")
+        return {"ok": True, "delivered": False, "reason": "recipient_not_found"}
+    try:
+        await bot.send_message(int(target_id), text)
+        return {"ok": True, "delivered": True}
+    except Exception as e:
+        logger.error("customer-notify: не удалось отправить %s: %s", target_id, e)
+        return {"ok": False, "delivered": False, "error": str(e)}
+
+
 @app.get("/health")
 async def health_check():
     """Эндпоинт для проверки работоспособности."""
