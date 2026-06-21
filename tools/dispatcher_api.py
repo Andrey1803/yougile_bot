@@ -442,6 +442,9 @@ def format_profile_crm_snippet(disp: dict[str, Any]) -> str:
     ct = disp.get("convertedTask")
     if isinstance(ct, dict) and ct.get("statusLabel"):
         lines.append(f"Работы: {ct['statusLabel']}")
+    est_url = disp.get("estimateUrl")
+    if isinstance(est_url, str) and est_url.strip():
+        lines.append(f'📄 <a href="{est_url.strip()}">Смета</a>')
     return "\n".join(lines)
 
 
