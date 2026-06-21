@@ -28,6 +28,8 @@ from tools.dispatcher_api import (
     dispatcher_inbound_record_id,
     dispatcher_inbound_ready,
     fetch_customer_order_status,
+    format_customer_order_history_messages,
+    format_customer_order_status_message,
     format_dispatcher_result_for_admin,
     ping_dispatcher_integration,
     send_order_to_dispatcher,
@@ -806,25 +808,10 @@ async def cmd_status(message: types.Message):
             logger.error("Dispatcher status lookup failed: %s", e)
             disp = {"ok": False, "found": False}
         if disp.get("ok") and disp.get("found"):
-            stage_label = disp.get("stageLabel") or disp.get("stage") or "—"
-            title = disp.get("title") or "Ваш заказ"
-            stage_key = str(disp.get("stage") or "")
-            emoji = {
-                "NEW": "🆕",
-                "IN_CONTACT": "💬",
-                "QUOTE": "📄",
-                "AGREED": "🤝",
-                "LOST": "❌",
-            }.get(stage_key, "📋")
-            lines = [
-                f"{emoji} <b>{title}</b>",
-                f"📌 Заявка: {stage_label}",
-            ]
-            ct = disp.get("convertedTask")
-            if isinstance(ct, dict) and ct.get("statusLabel"):
-                lines.append(f"🔧 Работы: {ct['statusLabel']}")
-            await message.answer("\n".join(lines))
-            return
+            text = format_customer_order_status_message(disp)
+            if text:
+                await message.answer(text)
+                return
 
     # Ищем последние задачи пользователя в YouGile
     try:
@@ -2098,6 +2085,21 @@ async def my_orders(message: types.Message):
         await message.answer("⛔ Это меню только для клиентов.")
         return
     user_id = str(message.from_user.id)
+    users = await load_users()
+    user_data = users.get(user_id, {})
+    phone = (user_data.get("phone") or "").strip()
+
+    if phone and dispatcher_inbound_ready():
+        try:
+            disp = fetch_customer_order_status(phone)
+        except Exception as e:
+            logger.error("Dispatcher orders history failed: %s", e)
+            disp = {"ok": False, "found": False}
+        messages = format_customer_order_history_messages(disp, limit=5)
+        if messages:
+            for text in messages:
+                await message.answer(text)
+            return
 
     # Ищем в локальном логе
     try:

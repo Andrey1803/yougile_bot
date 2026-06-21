@@ -2,7 +2,7 @@ import calendar
 import hashlib
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import requests
@@ -356,3 +356,58 @@ def fetch_customer_order_status(phone: str, *, group_id: str | None = None, time
     except Exception as e:
         logger.exception("Dispatcher customer-order-status failed")
         return {"ok": False, "error": str(e), "found": False}
+
+
+_LEAD_STAGE_EMOJI = {
+    "NEW": "🆕",
+    "IN_CONTACT": "💬",
+    "QUOTE": "📄",
+    "AGREED": "🤝",
+    "LOST": "❌",
+}
+
+
+def _format_lead_status_block(entry: dict[str, Any]) -> str:
+    stage_key = str(entry.get("stage") or "")
+    emoji = _LEAD_STAGE_EMOJI.get(stage_key, "📋")
+    title = entry.get("title") or "Ваш заказ"
+    stage_label = entry.get("stageLabel") or stage_key or "—"
+    lines = [f"{emoji} <b>{title}</b>", f"📌 Заявка: {stage_label}"]
+    ct = entry.get("convertedTask")
+    if isinstance(ct, dict) and ct.get("statusLabel"):
+        lines.append(f"🔧 Работы: {ct['statusLabel']}")
+    updated = entry.get("updatedAt")
+    if updated:
+        try:
+            dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+            lines.append(f"🕐 Обновлено: {dt.strftime('%d.%m.%Y %H:%M')}")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def format_customer_order_status_message(disp: dict[str, Any]) -> str | None:
+    """HTML для /status из ответа customer-order-status."""
+    if not isinstance(disp, dict) or not disp.get("ok") or not disp.get("found"):
+        return None
+    text = _format_lead_status_block(disp)
+    history = disp.get("history")
+    if isinstance(history, list) and len(history) > 1:
+        text += f"\n\n📚 Заявок по вашему телефону: <b>{len(history)}</b>"
+    return text
+
+
+def format_customer_order_history_messages(disp: dict[str, Any], *, limit: int = 5) -> list[str]:
+    """Список HTML-сообщений для «Мои заказы»."""
+    if not isinstance(disp, dict) or not disp.get("ok") or not disp.get("found"):
+        return []
+    history = disp.get("history")
+    if not isinstance(history, list) or not history:
+        history = [disp]
+    out: list[str] = []
+    for i, entry in enumerate(history[:limit]):
+        if not isinstance(entry, dict):
+            continue
+        header = "📋 <b>Последний заказ</b>" if i == 0 else f"📋 <b>Заказ #{len(history) - i}</b>"
+        out.append(f"{header}\n\n{_format_lead_status_block(entry)}")
+    return out
