@@ -403,6 +403,9 @@ def _format_lead_status_block(entry: dict[str, Any]) -> str:
     addr = entry.get("address")
     if isinstance(addr, str) and addr.strip():
         lines.append(f"📍 {addr.strip()}")
+    est_url = entry.get("estimateUrl")
+    if isinstance(est_url, str) and est_url.strip():
+        lines.append(f'📄 <a href="{est_url.strip()}">Смета</a>')
     ct = entry.get("convertedTask")
     if isinstance(ct, dict) and ct.get("statusLabel"):
         lines.append(f"🔧 Работы: {ct['statusLabel']}")

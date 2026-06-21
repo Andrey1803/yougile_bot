@@ -252,6 +252,7 @@ def admin_menu_kb():
 def main_menu_kb(user_data: dict = None):
     """Главное меню клиента."""
     buttons = [[KeyboardButton(text="🧾 Сделать заказ")]]
+    buttons.append([KeyboardButton(text="🏠 Кабинет")])
     if user_data and user_data.get("phone"):
         buttons.append([KeyboardButton(text="🔄 Повторить заказ")])
     buttons.append([KeyboardButton(text="📋 Мои заказы")])
@@ -271,6 +272,7 @@ async def main_menu_kb_with_admin(user_id: str, user_data: dict = None):
         return admin_menu_kb()
 
     buttons = [[KeyboardButton(text="🧾 Сделать заказ")]]
+    buttons.append([KeyboardButton(text="🏠 Кабинет")])
     if user_data and user_data.get("phone"):
         buttons.append([KeyboardButton(text="🔄 Повторить заказ")])
     buttons.append([KeyboardButton(text="📋 Мои заказы")])
@@ -807,7 +809,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer(
             f"Привет, {message.from_user.full_name}! 👋\n"
             "Я приму ваш заказ и передам менеджеру.\n"
-            "Нажмите кнопку ниже, чтобы оформить заявку."
+            "«🏠 Кабинет» — статус, заказы и настройки в одном месте.\n"
+            "Или нажмите «🧾 Сделать заказ», чтобы оформить заявку."
             f"{maint_info}",
             reply_markup=await main_menu_kb_with_admin(str(message.from_user.id), user_data)
         )
@@ -832,11 +835,13 @@ async def cmd_help(message: types.Message):
         "📋 <b>Доступные команды:</b>\n\n"
         "/start — Начать работу с ботом\n"
         "/help — Показать это сообщение\n"
+        "/cabinet — Личный кабинет (статус, заказы, настройки)\n"
         "/profile — Мой профиль и дата ТО\n"
         "/status — Статус последнего заказа\n"
         "/rate — Оценить качество обслуживания\n\n"
         "🧾 <b>Кнопки:</b>\n"
         "• Сделать заказ — оформить заявку\n"
+        "• Кабинет — статус, заказы и настройки\n"
         "• Повторить заказ — быстро заказать то же самое\n"
         "• Мои заказы — история заказов\n"
         "• Статус заказа — этап заявки и работ\n\n"
@@ -2774,7 +2779,7 @@ async def dispatcher_customer_notify(request: Request):
         logger.info("customer-notify: получатель не найден (phone=%s tg=%s)", phone[:6] if phone else "", tg_raw[:6] if tg_raw else "")
         return {"ok": True, "delivered": False, "reason": "recipient_not_found"}
     try:
-        await bot.send_message(int(target_id), text)
+        await bot.send_message(int(target_id), text, reply_markup=client_cabinet_inline_kb())
         return {"ok": True, "delivered": True}
     except Exception as e:
         logger.error("customer-notify: не удалось отправить %s: %s", target_id, e)
