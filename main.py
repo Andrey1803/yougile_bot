@@ -29,8 +29,11 @@ from tools.dispatcher_api import (
     dispatcher_inbound_ready,
     fetch_customer_order_status,
     fetch_dispatcher_status_for_user,
+    find_history_entry,
+    format_customer_order_history_items,
     format_customer_order_history_messages,
     format_customer_order_status_message,
+    format_lead_status_block,
     format_profile_crm_snippet,
     format_dispatcher_result_for_admin,
     ping_dispatcher_integration,
@@ -432,10 +435,11 @@ def get_last_order(user_id: str) -> dict | None:
     if not matches:
         return None
 
-    # Берём последнее совпадение + контекст до него
     last_match = matches[-1]
-    # Ищем начало этого заказа (📦 <b>Новый заказ</b>)
-    start = content.rfind("📦", 0, last_match.start())
+    # Ищем начало этого заказа (📦 новый или 🔄 повторный)
+    start_pkg = content.rfind("📦", 0, last_match.start())
+    start_rep = content.rfind("🔄", 0, last_match.start())
+    start = max(start_pkg, start_rep)
     if start == -1:
         start = last_match.start() - 200
 
@@ -610,6 +614,103 @@ async def _notify_admin_dispatcher_result(disp: dict, *, context: str) -> None:
         )
     except Exception as e:
         logger.error("Не удалось уведомить админа о диспетчере: %s", e)
+
+
+async def finalize_repeat_order(
+    message: types.Message,
+    *,
+    name: str,
+    phone: str,
+    address: str,
+    comment: str,
+    category: str,
+    user_data: dict,
+) -> None:
+    """Отправка повторного заказа: лог, диспетчер, YouGile, ответ клиенту."""
+    user_id = str(message.from_user.id)
+    summary = (
+        f"🔄 <b>{category}</b>\n"
+        f"👤 Имя: {name}\n"
+        f"📱 Телефон: {phone}\n"
+        f"📍 Адрес: {address}\n"
+        f"💬 Комментарий: {comment}\n"
+        f"🆔 Клиент: {message.from_user.full_name} (id: <code>{user_id}</code>)"
+    )
+
+    if ADMIN_ID is not None:
+        try:
+            await bot.send_message(ADMIN_ID, summary)
+        except Exception as e:
+            logger.error(f"❌ Не удалось уведомить админа: {e}")
+
+    async with aiofiles.open(ORDER_LOG, "a", encoding="utf-8") as f:
+        await f.write(summary + "\n\n")
+
+    disp = send_order_to_dispatcher(
+        category=category,
+        name=name,
+        phone=phone,
+        address=address,
+        comment=comment,
+        telegram_user_id=user_id,
+        telegram_full_name=message.from_user.full_name or name,
+    )
+    task: dict = {}
+    yougile_err: Exception | None = None
+    try:
+        task = create_task(title=f"{category} от {name}", description=summary)
+    except Exception as e:
+        logger.exception("❌ Ошибка при создании задачи в YouGile")
+        yougile_err = e
+
+    await _notify_admin_dispatcher_result(disp, context=f"🔄 {category}")
+
+    lines = ["✅ Повторный заказ принят!"]
+    if disp.get("ok") and dispatcher_inbound_record_id(disp):
+        if disp.get("leadId"):
+            lines.append(f"📥 Диспетчер (заявка): <code>{disp['leadId']}</code>")
+        else:
+            lines.append(f"📋 Диспетчер: <code>{disp['taskId']}</code>")
+        _dg = disp.get("groupId")
+        if _dg:
+            lines.append(f"📂 Группа в Диспетчере (id): <code>{_dg}</code> — откройте вкладку «Заявки» в этой группе.")
+    elif not disp.get("skipped"):
+        lines.append("⚠️ Диспетчер: не удалось создать заявку (проверьте логи и .env).")
+    if task.get("id"):
+        lines.append(f"📋 YouGile: <code>{task['id']}</code>")
+    elif yougile_err:
+        lines.append(f"⚠️ YouGile: {yougile_err}")
+    if not disp.get("ok") and not task.get("id") and not disp.get("skipped"):
+        lines = [
+            "⚠️ Заказ зафиксирован у админа, но не записан ни в диспетчер, ни в YouGile.",
+            f"Ошибка YouGile: {yougile_err}" if yougile_err else "",
+        ]
+        lines = [x for x in lines if x]
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=await main_menu_kb_with_admin(user_id, user_data),
+    )
+    await dp.storage.clear(chat_id=message.chat.id, user_id=message.from_user.id)
+
+
+async def show_client_cabinet(message: types.Message, user_id: str, user_data: dict) -> None:
+    crm_block = ""
+    if dispatcher_inbound_ready():
+        phone_norm = normalize_phone(user_data.get("phone") or "") if user_data.get("phone") else None
+        try:
+            disp = fetch_dispatcher_status_for_user(
+                phone=phone_norm,
+                telegram_user_id=user_id,
+                group_id=DISPATCHER_GROUP_ID or None,
+            )
+            crm_block = format_profile_crm_snippet(disp)
+        except Exception:
+            crm_block = "📌 <b>Заказ:</b> CRM временно недоступна"
+    await message.answer(
+        f"🏠 <b>Личный кабинет</b>\n\n{crm_block}\n\nВыберите действие:",
+        reply_markup=client_cabinet_inline_kb(),
+    )
 
 
 # ─── Фича 6: Автоответчик вне рабочего времени ──────────────────────────────
@@ -1389,120 +1490,108 @@ async def repeat_order(message: types.Message):
         )
         return
 
-    last_order = get_last_order(user_id)
-    if not last_order:
-        await message.answer("⚠️ Не удалось найти ваш последний заказ.")
-        return
+    preview_text = None
+    repeat_lead_id = None
+    if dispatcher_inbound_ready():
+        try:
+            disp = fetch_customer_order_status(
+                normalize_phone(user_data.get("phone") or "") or None,
+                telegram_user_id=user_id,
+                group_id=DISPATCHER_GROUP_ID or None,
+            )
+            if disp.get("found"):
+                preview_text = format_customer_order_status_message(disp)
+                repeat_lead_id = disp.get("leadId")
+        except Exception as e:
+            logger.error("CRM repeat preview failed: %s", e)
 
-    # Подтверждение
+    if not preview_text:
+        last_order = get_last_order(user_id)
+        if not last_order:
+            await message.answer("⚠️ Не удалось найти ваш последний заказ.")
+            return
+        preview_text = last_order["text"]
+
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Подтвердить")],
             [KeyboardButton(text="❌ Отмена")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
     await message.answer(
         "🔄 <b>Повторить последний заказ?</b>\n\n"
-        f"{last_order['text']}\n\n"
+        f"{preview_text}\n\n"
         "Нажмите «✅ Подтвердить» или «❌ Отмена».",
-        reply_markup=kb
+        reply_markup=kb,
     )
-    # Сохраняем в FSM для следующего шага
     state_data = await dp.storage.get_data(chat_id=message.chat.id, user_id=message.from_user.id)
     state_data["repeat_order"] = True
+    if repeat_lead_id:
+        state_data["repeat_lead_id"] = str(repeat_lead_id)
+    else:
+        state_data.pop("repeat_lead_id", None)
     await dp.storage.set_data(chat_id=message.chat.id, user_id=message.from_user.id, data=state_data)
 
 
 @dp.message(F.text == "✅ Подтвердить")
 async def confirm_repeat_order(message: types.Message):
+    state_data = await dp.storage.get_data(chat_id=message.chat.id, user_id=message.from_user.id)
+    if not state_data.get("repeat_order"):
+        return
+
     user_id = str(message.from_user.id)
     users = await load_users()
     user_data = users.get(user_id, {})
 
     name = display_contact_name_for_order(message, user_data)
     phone = user_data.get("phone", "—")
-
-    # Адрес — из профиля; комментарий — из последнего заказа в логе
-    last_order = get_last_order(user_id)
     address = (user_data.get("last_address") or "").strip() or "—"
     comment = "Повторный заказ"
-    if last_order:
-        comm_match = re.search(r"💬 Комментарий: (.+)", last_order["text"])
-        if comm_match and comm_match.group(1) != "—":
-            comment = comm_match.group(1) + " (повтор)"
-        if address == "—":
-            addr_match = re.search(r"📍 Адрес: (.+)", last_order["text"])
-            if addr_match:
-                address = addr_match.group(1).strip()
+    category = "Повторный заказ"
 
-    summary = (
-        "🔄 <b>Повторный заказ</b>\n"
-        f"👤 Имя: {name}\n"
-        f"📱 Телефон: {phone}\n"
-        f"📍 Адрес: {address}\n"
-        f"💬 Комментарий: {comment}\n"
-        f"🆔 Клиент: {message.from_user.full_name} (id: <code>{message.from_user.id}</code>)"
-    )
-
-    # Уведомляем админа
-    if ADMIN_ID is not None:
+    lead_id = state_data.get("repeat_lead_id")
+    if lead_id and dispatcher_inbound_ready():
         try:
-            await bot.send_message(ADMIN_ID, summary)
+            disp = fetch_customer_order_status(
+                normalize_phone(user_data.get("phone") or "") or None,
+                telegram_user_id=user_id,
+                group_id=DISPATCHER_GROUP_ID or None,
+            )
+            entry = find_history_entry(disp, str(lead_id))
+            if entry:
+                title = str(entry.get("title") or "Заказ").strip() or "Заказ"
+                category = f"Повтор: {title[:48]}"
+                address = str(entry.get("address") or "").strip() or address
+                comment = f"Повтор заказа «{title}»"
+                desc = str(entry.get("description") or "").strip()
+                if desc:
+                    comment = f"{comment}. {desc[:300]}"
+                entry_phone = str(entry.get("phone") or "").strip()
+                if entry_phone:
+                    phone = entry_phone
         except Exception as e:
-            logger.error(f"❌ Не удалось уведомить админа: {e}")
+            logger.error("CRM repeat confirm failed: %s", e)
+    else:
+        last_order = get_last_order(user_id)
+        if last_order:
+            comm_match = re.search(r"💬 Комментарий: (.+)", last_order["text"])
+            if comm_match and comm_match.group(1) != "—":
+                comment = comm_match.group(1) + " (повтор)"
+            if address == "—":
+                addr_match = re.search(r"📍 Адрес: (.+)", last_order["text"])
+                if addr_match:
+                    address = addr_match.group(1).strip()
 
-    async with aiofiles.open(ORDER_LOG, "a", encoding="utf-8") as f:
-        await f.write(summary + "\n\n")
-
-    disp = send_order_to_dispatcher(
-        category="Повторный заказ",
+    await finalize_repeat_order(
+        message,
         name=name,
         phone=phone,
         address=address,
         comment=comment,
-        telegram_user_id=str(message.from_user.id),
-        telegram_full_name=message.from_user.full_name or name,
+        category=category,
+        user_data=user_data,
     )
-    task: dict = {}
-    yougile_err: Exception | None = None
-    try:
-        task = create_task(title=f"Повторный заказ от {name}", description=summary)
-    except Exception as e:
-        logger.exception("❌ Ошибка при создании задачи в YouGile")
-        yougile_err = e
-
-    await _notify_admin_dispatcher_result(disp, context="🔄 Повторный заказ")
-
-    lines = ["✅ Повторный заказ принят!"]
-    if disp.get("ok") and dispatcher_inbound_record_id(disp):
-        if disp.get("leadId"):
-            lines.append(f"📥 Диспетчер (заявка): <code>{disp['leadId']}</code>")
-        else:
-            lines.append(f"📋 Диспетчер: <code>{disp['taskId']}</code>")
-        _dg = disp.get("groupId")
-        if _dg:
-            lines.append(f"📂 Группа в Диспетчере (id): <code>{_dg}</code> — откройте вкладку «Заявки» в этой группе.")
-    elif not disp.get("skipped"):
-        lines.append("⚠️ Диспетчер: не удалось создать заявку (проверьте логи и .env).")
-    if task.get("id"):
-        lines.append(f"📋 YouGile: <code>{task['id']}</code>")
-    elif yougile_err:
-        lines.append(f"⚠️ YouGile: {yougile_err}")
-    if not disp.get("ok") and not task.get("id") and not disp.get("skipped"):
-        lines = [
-            "⚠️ Заказ зафиксирован у админа, но не записан ни в диспетчер, ни в YouGile.",
-            f"Ошибка YouGile: {yougile_err}" if yougile_err else "",
-        ]
-        lines = [x for x in lines if x]
-
-    await message.answer(
-        "\n".join(lines),
-        reply_markup=await main_menu_kb_with_admin(str(message.from_user.id), user_data),
-    )
-
-    # Очищаем FSM
-    await dp.storage.clear(chat_id=message.chat.id, user_id=message.from_user.id)
 
 
 # ─── Фича 8: Категории услуг + обычный заказ ───────────────────────────────
@@ -1710,12 +1799,27 @@ async def finalize_order(message: types.Message, state: FSMContext):
 @dp.message(F.text == "❌ Отмена", StateFilter("*"))
 async def cancel_order(message: types.Message, state: FSMContext):
     await state.clear()
+    await dp.storage.clear(chat_id=message.chat.id, user_id=message.from_user.id)
     users = await load_users()
     user_data = users.get(str(message.from_user.id), {})
     await message.answer("Оформление заказа отменено.", reply_markup=await main_menu_kb_with_admin(str(message.from_user.id), user_data))
 
 
 # ─── Кнопки главного меню ──────────────────────────────────────────────────
+@dp.message(Command("cabinet"))
+async def cmd_cabinet(message: types.Message):
+    user_id = str(message.from_user.id)
+    users = await load_users()
+    await show_client_cabinet(message, user_id, users.get(user_id, {}))
+
+
+@dp.message(F.text == "🏠 Кабинет")
+async def btn_cabinet(message: types.Message):
+    user_id = str(message.from_user.id)
+    users = await load_users()
+    await show_client_cabinet(message, user_id, users.get(user_id, {}))
+
+
 @dp.message(F.text == "👤 Мой профиль")
 async def btn_profile(message: types.Message):
     await cmd_profile(message)
@@ -1895,6 +1999,95 @@ async def cb_cabinet_new_order(callback: types.CallbackQuery, state: FSMContext)
 async def cb_cabinet_settings(callback: types.CallbackQuery):
     await callback.answer()
     await answer_settings_panel(callback.message)
+
+
+@dp.callback_query(F.data.startswith("repeat_lead:"))
+async def cb_repeat_lead(callback: types.CallbackQuery):
+    await callback.answer()
+    if str(callback.from_user.id) == str(ADMIN_ID):
+        await callback.message.answer("⛔ Администратор не может оформлять заказы.")
+        return
+    lead_id = callback.data.split(":", 1)[1]
+    user_id = str(callback.from_user.id)
+    users = await load_users()
+    user_data = users.get(user_id, {})
+    if not user_data.get("phone"):
+        await callback.message.answer("⚠️ Сначала укажите телефон в настройках.")
+        return
+    if not dispatcher_inbound_ready():
+        await callback.message.answer("⚠️ Повтор из истории доступен только с CRM диспетчера.")
+        return
+    try:
+        disp = fetch_customer_order_status(
+            normalize_phone(user_data.get("phone") or "") or None,
+            telegram_user_id=user_id,
+            group_id=DISPATCHER_GROUP_ID or None,
+        )
+    except Exception as e:
+        logger.error("repeat_lead lookup failed: %s", e)
+        await callback.message.answer("⚠️ Не удалось загрузить заявку.")
+        return
+    entry = find_history_entry(disp, lead_id)
+    if not entry:
+        await callback.message.answer("⚠️ Заявка не найдена.")
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"repeat_lead_confirm:{lead_id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="repeat_lead_cancel")],
+        ]
+    )
+    await callback.message.answer(
+        f"🔄 <b>Повторить этот заказ?</b>\n\n{format_lead_status_block(entry)}",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("repeat_lead_confirm:"))
+async def cb_repeat_lead_confirm(callback: types.CallbackQuery):
+    lead_id = callback.data.split(":", 1)[1]
+    user_id = str(callback.from_user.id)
+    users = await load_users()
+    user_data = users.get(user_id, {})
+    if not user_data.get("phone"):
+        await callback.answer("Укажите телефон в настройках", show_alert=True)
+        return
+    try:
+        disp = fetch_customer_order_status(
+            normalize_phone(user_data.get("phone") or "") or None,
+            telegram_user_id=user_id,
+            group_id=DISPATCHER_GROUP_ID or None,
+        )
+        entry = find_history_entry(disp, lead_id)
+    except Exception:
+        entry = None
+    if not entry:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    title = str(entry.get("title") or "Заказ").strip() or "Заказ"
+    name = display_contact_name_for_order(callback.message, user_data)
+    phone = str(entry.get("phone") or user_data.get("phone") or "—")
+    address = str(entry.get("address") or "").strip() or (user_data.get("last_address") or "").strip() or "—"
+    comment = f"Повтор заказа «{title}»"
+    desc = str(entry.get("description") or "").strip()
+    if desc:
+        comment = f"{comment}. {desc[:300]}"
+    await finalize_repeat_order(
+        callback.message,
+        name=name,
+        phone=phone,
+        address=address,
+        comment=comment,
+        category=f"Повтор: {title[:48]}",
+        user_data=user_data,
+    )
+    await callback.answer("Заказ принят")
+
+
+@dp.callback_query(F.data == "repeat_lead_cancel")
+async def cb_repeat_lead_cancel(callback: types.CallbackQuery):
+    await callback.message.edit_text("Повтор заказа отменён.")
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "settings_back")
@@ -2161,13 +2354,25 @@ async def my_orders(message: types.Message):
         except Exception as e:
             logger.error("Dispatcher orders history failed: %s", e)
             disp = {"ok": False, "found": False}
-        messages = format_customer_order_history_messages(disp, limit=5)
+        messages = format_customer_order_history_items(disp, limit=5)
         if messages:
-            for i, text in enumerate(messages):
-                await message.answer(
-                    text,
-                    reply_markup=menu_kb if i == len(messages) - 1 else None,
-                )
+            for item in messages:
+                lead_id = item.get("lead_id")
+                if lead_id:
+                    row_kb = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="🔄 Повторить",
+                                    callback_data=f"repeat_lead:{lead_id}",
+                                )
+                            ]
+                        ]
+                    )
+                    await message.answer(item["text"], reply_markup=row_kb)
+                else:
+                    await message.answer(item["text"])
+            await message.answer("👇 Меню", reply_markup=menu_kb)
             return
 
     # Ищем в локальном логе
@@ -2179,7 +2384,7 @@ async def my_orders(message: types.Message):
         return
 
     # Извлекаем заказы пользователя
-    pattern = rf"(📦 <b>Новый заказ</b>.*?id: <code>{user_id}</code>\))"
+    pattern = rf"((?:📦 <b>Новый заказ</b>|🔄 <b>).*?id: <code>{user_id}</code>\))"
     matches = re.findall(pattern, log_content, re.DOTALL)
 
     if not matches:

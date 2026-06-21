@@ -400,6 +400,9 @@ def _format_lead_status_block(entry: dict[str, Any]) -> str:
     title = entry.get("title") or "Ваш заказ"
     stage_label = entry.get("stageLabel") or stage_key or "—"
     lines = [f"{emoji} <b>{title}</b>", f"📌 Заявка: {stage_label}"]
+    addr = entry.get("address")
+    if isinstance(addr, str) and addr.strip():
+        lines.append(f"📍 {addr.strip()}")
     ct = entry.get("convertedTask")
     if isinstance(ct, dict) and ct.get("statusLabel"):
         lines.append(f"🔧 Работы: {ct['statusLabel']}")
@@ -453,17 +456,73 @@ def fetch_dispatcher_status_for_user(
     )
 
 
+def format_lead_status_block(entry: dict[str, Any]) -> str:
+    """Публичная обёртка для отображения заявки CRM."""
+    return _format_lead_status_block(entry)
+
+
 def format_customer_order_history_messages(disp: dict[str, Any], *, limit: int = 5) -> list[str]:
     """Список HTML-сообщений для «Мои заказы»."""
+    return [item["text"] for item in format_customer_order_history_items(disp, limit=limit)]
+
+
+def find_history_entry(disp: dict[str, Any], lead_id: str) -> dict[str, Any] | None:
+    if not lead_id:
+        return None
+    history = disp.get("history")
+    if isinstance(history, list):
+        for entry in history:
+            if isinstance(entry, dict) and str(entry.get("leadId")) == str(lead_id):
+                return entry
+    if str(disp.get("leadId")) == str(lead_id):
+        return disp
+    return None
+
+
+def format_customer_order_history_items(disp: dict[str, Any], *, limit: int = 5) -> list[dict[str, Any]]:
+    """Элементы истории: text (HTML), lead_id для кнопки «Повторить»."""
     if not isinstance(disp, dict) or not disp.get("ok") or not disp.get("found"):
         return []
     history = disp.get("history")
     if not isinstance(history, list) or not history:
         history = [disp]
-    out: list[str] = []
+    out: list[dict[str, Any]] = []
     for i, entry in enumerate(history[:limit]):
         if not isinstance(entry, dict):
             continue
         header = "📋 <b>Последний заказ</b>" if i == 0 else f"📋 <b>Заказ #{len(history) - i}</b>"
-        out.append(f"{header}\n\n{_format_lead_status_block(entry)}")
+        lead_id = entry.get("leadId")
+        out.append(
+            {
+                "text": f"{header}\n\n{_format_lead_status_block(entry)}",
+                "lead_id": str(lead_id) if lead_id else None,
+            }
+        )
     return out
+
+
+def submit_repeat_order_from_entry(
+    entry: dict[str, Any],
+    *,
+    name: str,
+    phone: str,
+    fallback_address: str,
+    telegram_user_id: str,
+    telegram_full_name: str,
+) -> dict[str, Any]:
+    title = str(entry.get("title") or "Заказ").strip() or "Заказ"
+    address = str(entry.get("address") or "").strip() or (fallback_address or "").strip() or "—"
+    use_phone = (phone or str(entry.get("phone") or "")).strip() or "—"
+    comment = f"Повтор заказа «{title}»"
+    desc = str(entry.get("description") or "").strip()
+    if desc:
+        comment = f"{comment}. {desc[:300]}"
+    return send_order_to_dispatcher(
+        category=f"Повтор: {title[:48]}",
+        name=name or str(entry.get("contactName") or "").strip() or telegram_full_name,
+        phone=use_phone,
+        address=address,
+        comment=comment,
+        telegram_user_id=telegram_user_id,
+        telegram_full_name=telegram_full_name,
+    )
