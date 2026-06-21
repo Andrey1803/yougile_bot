@@ -327,3 +327,32 @@ def send_order_to_dispatcher(
             payload["initialStatus"] = st0
 
     return post_inbound_order_payload(payload, timeout_sec=20)
+
+
+def fetch_customer_order_status(phone: str, *, group_id: str | None = None, timeout_sec: float = 12) -> dict[str, Any]:
+    """Статус заявки/задачи в диспетчере по телефону клиента."""
+    if not _enabled():
+        return {"ok": False, "skipped": True, "reason": "dispatcher_env_missing", "found": False}
+    base = (DISPATCHER_API_URL or "").strip().rstrip("/")
+    if not base:
+        return {"ok": False, "skipped": True, "reason": "no_url", "found": False}
+    params: dict[str, str] = {"phone": (phone or "").strip()}
+    if group_id:
+        params["groupId"] = group_id.strip()
+    url = f"{base}/v1/integration/customer-order-status"
+    headers = {
+        "Authorization": f"Bearer {DISPATCHER_INBOUND_API_KEY}",
+        "Accept": "application/json",
+    }
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout_sec)
+        if resp.status_code >= 400:
+            logger.warning("Dispatcher customer-order-status HTTP %s: %s", resp.status_code, resp.text[:200])
+            return {"ok": False, "error": f"HTTP {resp.status_code}", "found": False}
+        data = resp.json()
+        if isinstance(data, dict):
+            return data
+        return {"ok": False, "error": "bad_json", "found": False}
+    except Exception as e:
+        logger.exception("Dispatcher customer-order-status failed")
+        return {"ok": False, "error": str(e), "found": False}
