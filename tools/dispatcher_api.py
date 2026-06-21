@@ -107,6 +107,15 @@ def describe_dispatcher_config() -> str:
     return "; ".join(parts)
 
 
+def dispatcher_inbound_record_id(disp: dict[str, Any]) -> str | None:
+    """ID созданной записи в диспетчере: заявка (leadId) или задача (taskId)."""
+    lid = disp.get("leadId")
+    if lid:
+        return str(lid)
+    tid = disp.get("taskId")
+    return str(tid) if tid else None
+
+
 def format_dispatcher_result_for_admin(disp: dict[str, Any]) -> str:
     """Текст для уведомления админа о результате send_order_to_dispatcher."""
     if disp.get("skipped"):
@@ -117,9 +126,13 @@ def format_dispatcher_result_for_admin(disp: dict[str, Any]) -> str:
         }
         hint = hints.get(str(reason), describe_dispatcher_config())
         return f"⚠️ Диспетчер пропущен ({reason}): {hint}"
-    if disp.get("ok") and disp.get("taskId"):
+    if disp.get("ok") and dispatcher_inbound_record_id(disp):
         gid = disp.get("groupId")
         extra = f"\n📂 groupId: <code>{gid}</code>" if gid else ""
+        if disp.get("reused"):
+            return f"♻️ Диспетчер: повторный заказ → заявка <code>{disp.get('leadId')}</code>{extra}"
+        if disp.get("leadId"):
+            return f"✅ Диспетчер: заявка <code>{disp['leadId']}</code>{extra}"
         return f"✅ Диспетчер: задача <code>{disp['taskId']}</code>{extra}"
     err = disp.get("error") or "неизвестная ошибка"
     return f"⚠️ Диспетчер не записал задачу: <code>{err}</code>"
@@ -186,7 +199,7 @@ def post_inbound_order_payload(payload: dict[str, Any], *, timeout_sec: float = 
     Не бросает исключения; ответ как у send_order_to_dispatcher.
     """
     if not _enabled():
-        return {"ok": False, "skipped": True, "reason": "dispatcher_env_missing", "taskId": None, "error": None}
+        return {"ok": False, "skipped": True, "reason": "dispatcher_env_missing", "taskId": None, "leadId": None, "error": None}
 
     url = f"{DISPATCHER_API_URL}/v1/integration/inbound-order"
     headers = {
@@ -199,9 +212,19 @@ def post_inbound_order_payload(payload: dict[str, Any], *, timeout_sec: float = 
         if resp.status_code in (200, 201):
             data = resp.json()
             if isinstance(data, dict):
+                lid = data.get("leadId")
                 tid = data.get("taskId")
-                logger.info("Dispatcher task created: %s", tid)
-                return {"ok": True, "skipped": False, "taskId": tid, "groupId": data.get("groupId"), "error": None, "raw": data}
+                logger.info("Dispatcher inbound created: leadId=%s taskId=%s", lid, tid)
+                return {
+                    "ok": True,
+                    "skipped": False,
+                    "leadId": lid,
+                    "taskId": tid,
+                    "groupId": data.get("groupId"),
+                    "stage": data.get("stage"),
+                    "error": None,
+                    "raw": data,
+                }
             logger.error("Dispatcher API: unexpected JSON shape: %s", str(data)[:300])
             return {"ok": False, "skipped": False, "taskId": None, "error": "invalid_json_shape"}
         err_text = (resp.text or "")[:800]
@@ -256,7 +279,7 @@ def send_order_to_dispatcher(
     Возвращает словарь с ключами ok, skipped, taskId, error (для логов и уведомления админа).
     """
     if not _enabled():
-        return {"ok": False, "skipped": True, "reason": "dispatcher_env_missing", "taskId": None, "error": None}
+        return {"ok": False, "skipped": True, "reason": "dispatcher_env_missing", "taskId": None, "leadId": None, "error": None}
 
     title = f"Заказ: {category} — {name}".strip()[:500] or "Новый заказ из Telegram"
     note = (
