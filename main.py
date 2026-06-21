@@ -28,8 +28,10 @@ from tools.dispatcher_api import (
     dispatcher_inbound_record_id,
     dispatcher_inbound_ready,
     fetch_customer_order_status,
+    fetch_dispatcher_status_for_user,
     format_customer_order_history_messages,
     format_customer_order_status_message,
+    format_profile_crm_snippet,
     format_dispatcher_result_for_admin,
     ping_dispatcher_integration,
     send_order_to_dispatcher,
@@ -217,6 +219,20 @@ def settings_kb():
         [InlineKeyboardButton(text="📱 Изменить телефон", callback_data="settings_edit_phone")],
         [InlineKeyboardButton(text="📍 Изменить адрес", callback_data="settings_edit_address")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_back")],
+    ])
+
+
+def client_cabinet_inline_kb():
+    """Быстрые действия — видны и на десктопе Telegram."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Статус", callback_data="cabinet_status"),
+            InlineKeyboardButton(text="📋 Заказы", callback_data="cabinet_orders"),
+        ],
+        [
+            InlineKeyboardButton(text="🧾 Заказ", callback_data="cabinet_new_order"),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="cabinet_settings"),
+        ],
     ])
 
 
@@ -740,6 +756,8 @@ async def cmd_profile(message: types.Message):
         await message.answer("⚠️ Вы ещё не зарегистрированы. Нажмите /start")
         return
 
+    menu_kb = await main_menu_kb_with_admin(user_id, user_data)
+
     # Админ — отдельный профиль
     if str(user_id) == str(ADMIN_ID):
         name = user_data.get("full_name", "—")
@@ -749,6 +767,18 @@ async def cmd_profile(message: types.Message):
         ratings = user_data.get("ratings", [])
         avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else "нет оценок"
         blocked = "Да" if user_data.get("blocked") else "Нет"
+        crm_block = ""
+        if dispatcher_inbound_ready():
+            phone_norm = normalize_phone(phone) if phone and phone != "—" else None
+            try:
+                disp = fetch_dispatcher_status_for_user(
+                    phone=phone_norm,
+                    telegram_user_id=user_id,
+                    group_id=DISPATCHER_GROUP_ID or None,
+                )
+                crm_block = "\n\n" + format_profile_crm_snippet(disp)
+            except Exception:
+                crm_block = "\n\n📌 <b>Заказ:</b> CRM временно недоступна"
 
         text = (
             f"🛡️ <b>Профиль администратора</b>\n\n"
@@ -759,8 +789,10 @@ async def cmd_profile(message: types.Message):
             f"Дата регистрации: {joined}\n"
             f"Средняя оценка: {avg_rating}\n"
             f"Заблокирован: {blocked}"
+            f"{crm_block}"
         )
-        await message.answer(text, reply_markup=await main_menu_kb_with_admin(user_id, user_data))
+        await message.answer(text, reply_markup=menu_kb)
+        await message.answer("👇 Быстрые действия", reply_markup=client_cabinet_inline_kb())
         return
 
     # Профиль клиента
@@ -782,6 +814,19 @@ async def cmd_profile(message: types.Message):
     else:
         maint_status = "⚪ Не определено"
 
+    crm_block = ""
+    if dispatcher_inbound_ready():
+        phone_norm = normalize_phone(phone) if phone and phone != "—" else None
+        try:
+            disp = fetch_dispatcher_status_for_user(
+                phone=phone_norm,
+                telegram_user_id=user_id,
+                group_id=DISPATCHER_GROUP_ID or None,
+            )
+            crm_block = "\n\n" + format_profile_crm_snippet(disp)
+        except Exception:
+            crm_block = "\n\n📌 <b>Заказ:</b> CRM временно недоступна"
+
     text = (
         f"👤 <b>Мой профиль</b>\n\n"
         f"Имя: {name}\n"
@@ -792,9 +837,11 @@ async def cmd_profile(message: types.Message):
         f"Заблокирован: {blocked}\n\n"
         f"🔧 <b>ТО скважины</b> (каждые {MAINTENANCE_INTERVAL_MONTHS} мес.):\n"
         f"Статус: {maint_status}"
+        f"{crm_block}"
     )
 
-    await message.answer(text, reply_markup=await main_menu_kb_with_admin(user_id, user_data))
+    await message.answer(text, reply_markup=menu_kb)
+    await message.answer("👇 Быстрые действия", reply_markup=client_cabinet_inline_kb())
 
 
 # ─── Фича 2: Статус заказа ──────────────────────────────────────────────────
@@ -1822,6 +1869,32 @@ async def cb_settings_address(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.edit_text("📍 Введите новый адрес:")
     await state.set_state(ProfileSettingsForm.editing_address)
+
+
+@dp.callback_query(F.data == "cabinet_status")
+async def cb_cabinet_status(callback: types.CallbackQuery):
+    await callback.answer()
+    user_id = str(callback.from_user.id)
+    users = await load_users()
+    await send_order_status(callback.message, user_id, users.get(user_id, {}))
+
+
+@dp.callback_query(F.data == "cabinet_orders")
+async def cb_cabinet_orders(callback: types.CallbackQuery):
+    await callback.answer()
+    await my_orders(callback.message)
+
+
+@dp.callback_query(F.data == "cabinet_new_order")
+async def cb_cabinet_new_order(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await start_order(callback.message, state)
+
+
+@dp.callback_query(F.data == "cabinet_settings")
+async def cb_cabinet_settings(callback: types.CallbackQuery):
+    await callback.answer()
+    await answer_settings_panel(callback.message)
 
 
 @dp.callback_query(F.data == "settings_back")

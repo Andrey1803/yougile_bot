@@ -424,6 +424,35 @@ def format_customer_order_status_message(disp: dict[str, Any]) -> str | None:
     return text
 
 
+def format_profile_crm_snippet(disp: dict[str, Any]) -> str:
+    """Краткий блок CRM для экрана «Мой профиль»."""
+    if not isinstance(disp, dict) or not disp.get("ok"):
+        return "📌 <b>Заказ:</b> CRM временно недоступна"
+    if not disp.get("found"):
+        return "📌 <b>Заказ:</b> активных заявок нет"
+    stage_label = disp.get("stageLabel") or disp.get("stage") or "—"
+    title = disp.get("title") or "Ваш заказ"
+    lines = [f"📌 <b>Заказ:</b> {title}", f"Стадия: {stage_label}"]
+    ct = disp.get("convertedTask")
+    if isinstance(ct, dict) and ct.get("statusLabel"):
+        lines.append(f"Работы: {ct['statusLabel']}")
+    return "\n".join(lines)
+
+
+def fetch_dispatcher_status_for_user(
+    *,
+    phone: str | None,
+    telegram_user_id: str,
+    group_id: str | None = None,
+) -> dict[str, Any]:
+    """Обёртка для профиля и /status."""
+    return fetch_customer_order_status(
+        phone,
+        telegram_user_id=telegram_user_id,
+        group_id=group_id,
+    )
+
+
 def format_customer_order_history_messages(disp: dict[str, Any], *, limit: int = 5) -> list[str]:
     """Список HTML-сообщений для «Мои заказы»."""
     if not isinstance(disp, dict) or not disp.get("ok") or not disp.get("found"):
