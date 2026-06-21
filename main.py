@@ -21,7 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 
-from config import API_TOKEN, ADMIN_ID, YOUGILE_WEBHOOK_SECRET, DISPATCHER_INBOUND_API_KEY
+from config import API_TOKEN, ADMIN_ID, YOUGILE_WEBHOOK_SECRET, DISPATCHER_INBOUND_API_KEY, DISPATCHER_GROUP_ID
 from tools.yougile_api import create_task, search_tasks_by_user, get_tasks_for_stats, get_column_name
 from tools.dispatcher_api import (
     describe_dispatcher_config,
@@ -225,6 +225,7 @@ def admin_menu_kb():
     buttons = [
         [KeyboardButton(text="🛡️ Админ-панель")],
         [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="📊 Статус заказа"), KeyboardButton(text="📋 Мои заказы")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -235,6 +236,7 @@ def main_menu_kb(user_data: dict = None):
     if user_data and user_data.get("phone"):
         buttons.append([KeyboardButton(text="🔄 Повторить заказ")])
     buttons.append([KeyboardButton(text="📋 Мои заказы")])
+    buttons.append([KeyboardButton(text="📊 Статус заказа")])
     buttons.append([KeyboardButton(text="👤 Мой профиль")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -253,6 +255,7 @@ async def main_menu_kb_with_admin(user_id: str, user_data: dict = None):
     if user_data and user_data.get("phone"):
         buttons.append([KeyboardButton(text="🔄 Повторить заказ")])
     buttons.append([KeyboardButton(text="📋 Мои заказы")])
+    buttons.append([KeyboardButton(text="📊 Статус заказа")])
     buttons.append([KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="⚙️ Настройки")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -718,7 +721,8 @@ async def cmd_help(message: types.Message):
         "🧾 <b>Кнопки:</b>\n"
         "• Сделать заказ — оформить заявку\n"
         "• Повторить заказ — быстро заказать то же самое\n"
-        "• Мои заказы — история заказов\n\n"
+        "• Мои заказы — история заказов\n"
+        "• Статус заказа — этап заявки и работ\n\n"
         "🕐 Часы работы: 08:00 — 20:00\n"
         f"{maint_info}",
         reply_markup=await main_menu_kb_with_admin(str(message.from_user.id), user_data)
@@ -794,90 +798,77 @@ async def cmd_profile(message: types.Message):
 
 
 # ─── Фича 2: Статус заказа ──────────────────────────────────────────────────
+async def send_order_status(message: types.Message, user_id: str, user_data: dict | None = None):
+    """Статус из диспетчера (CRM); клавиатура меню всегда прикрепляется."""
+    if user_data is None:
+        users = await load_users()
+        user_data = users.get(user_id, {})
+    menu_kb = await main_menu_kb_with_admin(user_id, user_data)
+    phone = normalize_phone((user_data.get("phone") or "").strip()) if user_data.get("phone") else ""
+
+    if dispatcher_inbound_ready():
+        try:
+            disp = fetch_customer_order_status(
+                phone or None,
+                telegram_user_id=user_id,
+                group_id=DISPATCHER_GROUP_ID or None,
+            )
+        except Exception as e:
+            logger.error("Dispatcher status lookup failed: %s", e)
+            disp = {"ok": False, "found": False, "error": str(e)}
+
+        if disp.get("ok") and disp.get("found"):
+            text = format_customer_order_status_message(disp)
+            if text:
+                await message.answer(text, reply_markup=menu_kb)
+                return
+
+        if disp.get("ok") and not disp.get("found"):
+            last_order = get_last_order(user_id)
+            lines = ["📭 <b>Заявка в CRM пока не найдена.</b>", "Если заказ только что оформлен — подождите минуту и нажмите «📊 Статус заказа» снова."]
+            if last_order:
+                lines.append("")
+                lines.append("📋 <b>Последний заказ в боте:</b>")
+                lines.append("")
+                lines.append(last_order["text"])
+            await message.answer("\n".join(lines), reply_markup=menu_kb)
+            return
+
+        err = disp.get("error") or disp.get("reason") or "ошибка связи"
+        await message.answer(
+            f"⚠️ Не удалось получить статус из диспетчера ({err}).\nПопробуйте позже или напишите менеджеру.",
+            reply_markup=menu_kb,
+        )
+        return
+
+    # Диспетчер не настроен — локальный лог / YouGile
+    last_order = get_last_order(user_id)
+    if last_order:
+        await message.answer(
+            "📋 <b>Ваш последний заказ:</b>\n\n"
+            f"{last_order['text']}\n\n"
+            "ℹ️ CRM диспетчера не подключена — точный этап заявки недоступен.",
+            reply_markup=menu_kb,
+        )
+        return
+
+    await message.answer("📭 У вас пока нет заказов.", reply_markup=menu_kb)
+
+
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     user_id = str(message.from_user.id)
     users = await load_users()
     user_data = users.get(user_id, {})
-    phone = (user_data.get("phone") or "").strip()
+    await send_order_status(message, user_id, user_data)
 
-    if phone and dispatcher_inbound_ready():
-        try:
-            disp = fetch_customer_order_status(phone)
-        except Exception as e:
-            logger.error("Dispatcher status lookup failed: %s", e)
-            disp = {"ok": False, "found": False}
-        if disp.get("ok") and disp.get("found"):
-            text = format_customer_order_status_message(disp)
-            if text:
-                await message.answer(text)
-                return
 
-    # Ищем последние задачи пользователя в YouGile
-    try:
-        tasks = search_tasks_by_user(user_id, limit=5)
-    except Exception as e:
-        logger.error(f"Ошибка при поиске задач: {e}")
-        # Фоллбэк — поиск в локальном логе
-        last_order = get_last_order(user_id)
-        if last_order:
-            await message.answer(
-                "📋 <b>Ваш последний заказ:</b>\n\n"
-                f"{last_order['text']}\n\n"
-                "ℹ️ Для точного статуса обратитесь к менеджеру."
-            )
-        else:
-            await message.answer("📭 У вас пока нет заказов.")
-        return
-
-    if not tasks:
-        last_order = get_last_order(user_id)
-        if last_order:
-            await message.answer(
-                "📋 <b>Ваш последний заказ:</b>\n\n"
-                f"{last_order['text']}\n\n"
-                "ℹ️ Статус задачи в YouGile не удалось получить. Обратитесь к менеджеру."
-            )
-        else:
-            await message.answer("📭 У вас пока нет заказов.")
-        return
-
-    # Показываем последние 3 задачи
-    for task in tasks[:3]:
-        task_id = task.get("id", "—")
-        title = task.get("title", "Без названия")
-        column_id = task.get("columnId", "")
-        column_name = "Загружается..."
-        if column_id:
-            try:
-                column_name = get_column_name(column_id)
-            except Exception:
-                column_name = column_id
-
-        status_emoji = {
-            "Новая": "🆕",
-            "В работе": "⏳",
-            "Выполнена": "✅",
-            "Отменена": "❌",
-        }
-        emoji = status_emoji.get(column_name, "📋")
-
-        created = task.get("created", "")
-        if created:
-            try:
-                created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                created_str = created_dt.strftime("%d.%m.%Y %H:%M")
-            except Exception:
-                created_str = created
-        else:
-            created_str = "—"
-
-        await message.answer(
-            f"{emoji} <b>{title}</b>\n"
-            f"📋 ID: <code>{task_id}</code>\n"
-            f"📌 Статус: {column_name}\n"
-            f"📅 Создан: {created_str}"
-        )
+@dp.message(F.text == "📊 Статус заказа")
+async def btn_order_status(message: types.Message):
+    user_id = str(message.from_user.id)
+    users = await load_users()
+    user_data = users.get(user_id, {})
+    await send_order_status(message, user_id, user_data)
 
 
 # ─── Фича 5: Статистика (только админ) ─────────────────────────────────────
@@ -2081,24 +2072,29 @@ async def btn_export(message: types.Message):
 # ─── Фича: Мои заказы (история) ─────────────────────────────────────────────
 @dp.message(F.text == "📋 Мои заказы")
 async def my_orders(message: types.Message):
-    if str(message.from_user.id) == str(ADMIN_ID):
-        await message.answer("⛔ Это меню только для клиентов.")
-        return
     user_id = str(message.from_user.id)
     users = await load_users()
     user_data = users.get(user_id, {})
-    phone = (user_data.get("phone") or "").strip()
+    menu_kb = await main_menu_kb_with_admin(user_id, user_data)
+    phone = normalize_phone((user_data.get("phone") or "").strip()) if user_data.get("phone") else ""
 
-    if phone and dispatcher_inbound_ready():
+    if dispatcher_inbound_ready():
         try:
-            disp = fetch_customer_order_status(phone)
+            disp = fetch_customer_order_status(
+                phone or None,
+                telegram_user_id=user_id,
+                group_id=DISPATCHER_GROUP_ID or None,
+            )
         except Exception as e:
             logger.error("Dispatcher orders history failed: %s", e)
             disp = {"ok": False, "found": False}
         messages = format_customer_order_history_messages(disp, limit=5)
         if messages:
-            for text in messages:
-                await message.answer(text)
+            for i, text in enumerate(messages):
+                await message.answer(
+                    text,
+                    reply_markup=menu_kb if i == len(messages) - 1 else None,
+                )
             return
 
     # Ищем в локальном логе
@@ -2106,7 +2102,7 @@ async def my_orders(message: types.Message):
         async with aiofiles.open(ORDER_LOG, "r", encoding="utf-8") as f:
             log_content = await f.read()
     except Exception:
-        await message.answer("⚠️ Не удалось загрузить историю заказов.")
+        await message.answer("⚠️ Не удалось загрузить историю заказов.", reply_markup=menu_kb)
         return
 
     # Извлекаем заказы пользователя
@@ -2114,16 +2110,22 @@ async def my_orders(message: types.Message):
     matches = re.findall(pattern, log_content, re.DOTALL)
 
     if not matches:
-        await message.answer("📭 У вас пока нет заказов.\nНажмите «🧾 Сделать заказ», чтобы оформить.")
+        await message.answer(
+            "📭 У вас пока нет заказов.\nНажмите «🧾 Сделать заказ», чтобы оформить.",
+            reply_markup=menu_kb,
+        )
         return
 
     # Показываем последние 3
     last_orders = matches[-3:]
     for i, order in enumerate(reversed(last_orders)):
-        # Чистим HTML для читаемости
         clean = order.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
         header = f"📋 <b>Заказ #{len(matches) - i}</b>" if i < 2 else f"📋 <b>Последний заказ</b>"
-        await message.answer(f"{header}\n\n{clean}")
+        is_last = i == len(last_orders) - 1
+        await message.answer(
+            f"{header}\n\n{clean}",
+            reply_markup=menu_kb if is_last else None,
+        )
 
 
 # ─── Обработка любых сообщений в FSM (подсказка) ────────────────────────────

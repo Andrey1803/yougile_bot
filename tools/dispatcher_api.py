@@ -27,6 +27,20 @@ logger = logging.getLogger(__name__)
 _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def _normalize_phone_digits(phone: str) -> str:
+    """Цифры телефона для API диспетчера (BY: 375XXXXXXXXX)."""
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 12 and digits[0] == "8":
+        digits = "375" + digits[1:]
+    if len(digits) == 9:
+        digits = "375" + digits
+    if len(digits) == 11 and digits[0] == "8":
+        digits = "7" + digits[1:]
+    if len(digits) == 10:
+        digits = "7" + digits
+    return digits
+
+
 def _local_today_ymd() -> str:
     t = date.today()
     return f"{t.year:04d}-{t.month:02d}-{t.day:02d}"
@@ -329,16 +343,29 @@ def send_order_to_dispatcher(
     return post_inbound_order_payload(payload, timeout_sec=20)
 
 
-def fetch_customer_order_status(phone: str, *, group_id: str | None = None, timeout_sec: float = 12) -> dict[str, Any]:
-    """Статус заявки/задачи в диспетчере по телефону клиента."""
+def fetch_customer_order_status(
+    phone: str | None = None,
+    *,
+    telegram_user_id: str | None = None,
+    group_id: str | None = None,
+    timeout_sec: float = 12,
+) -> dict[str, Any]:
+    """Статус заявки/задачи в диспетчере по телефону и/или Telegram user id."""
     if not _enabled():
         return {"ok": False, "skipped": True, "reason": "dispatcher_env_missing", "found": False}
     base = (DISPATCHER_API_URL or "").strip().rstrip("/")
     if not base:
         return {"ok": False, "skipped": True, "reason": "no_url", "found": False}
-    params: dict[str, str] = {"phone": (phone or "").strip()}
-    if group_id:
-        params["groupId"] = group_id.strip()
+    params: dict[str, str] = {}
+    if phone and str(phone).strip():
+        params["phone"] = _normalize_phone_digits(str(phone).strip())
+    if telegram_user_id and str(telegram_user_id).strip():
+        params["telegramUserId"] = str(telegram_user_id).strip()
+    gid = (group_id or DISPATCHER_GROUP_ID or "").strip()
+    if gid:
+        params["groupId"] = gid
+    if not params.get("phone") and not params.get("telegramUserId"):
+        return {"ok": False, "error": "no_lookup", "found": False}
     url = f"{base}/v1/integration/customer-order-status"
     headers = {
         "Authorization": f"Bearer {DISPATCHER_INBOUND_API_KEY}",
