@@ -21,7 +21,29 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 
 from config import API_TOKEN, ADMIN_ID, YOUGILE_WEBHOOK_SECRET
-from tools.yougile_api import create_task, search_tasks_by_user, get_tasks_for_stats, get_column_name
+from tools.yougile_api import (
+    create_task as _create_task_sync,
+    search_tasks_by_user as _search_tasks_sync,
+    get_tasks_for_stats as _get_stats_sync,
+    get_column_name as _get_column_name_sync,
+)
+
+
+# ─── Async-обёртки над sync YouGile API (не блокируем event loop) ───────────
+async def create_task(title: str, description: str = "") -> dict:
+    return await asyncio.to_thread(_create_task_sync, title, description)
+
+
+async def search_tasks_by_user(user_id: str, limit: int = 10) -> list:
+    return await asyncio.to_thread(_search_tasks_sync, user_id, limit)
+
+
+async def get_tasks_for_stats(days: int = 30) -> list:
+    return await asyncio.to_thread(_get_stats_sync, days)
+
+
+async def get_column_name(column_id: str) -> str:
+    return await asyncio.to_thread(_get_column_name_sync, column_id)
 
 import aiofiles
 
@@ -156,10 +178,8 @@ def normalize_phone(phone: str) -> str:
 
 
 def is_work_time() -> bool:
-    """Проверяет, находится ли текущее время в рабочем диапазоне."""
-    now_utc = datetime.now(timezone.utc)
-    now_local = now_utc.replace(tzinfo=timezone.utc)  # UTC
-    # Для простоты используем UTC; если нужно — добавьте смещение
+    """Проверяет, находится ли текущее время в рабочем диапазоне (Europe/Minsk, UTC+3)."""
+    now_local = datetime.now(timezone.utc) + timedelta(hours=WORK_TZ_HOURS)
     hour = now_local.hour
     return WORK_START_HOUR <= hour < WORK_END_HOUR
 
@@ -172,9 +192,9 @@ def get_last_order(user_id: str) -> dict | None:
     except Exception:
         return None
 
-    # Ищем заказы по ID пользователя
-    pattern = rf"🆔 Клиент:.*\(id: <code>{user_id}</code>\)"
-    matches = list(re.finditer(pattern, content))
+    # Ищем заказы по ID пользователя (экранируем ID, DOTALL для многострочности)
+    pattern = rf"🆔 Клиент:.*?\(id: <code>{re.escape(user_id)}</code>\)"
+    matches = list(re.finditer(pattern, content, re.DOTALL))
     if not matches:
         return None
 
@@ -306,9 +326,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     users = await load_users()
 
-    # Если пользователь уже был — не перезаписываем телефон
+    # Если пользователь уже был — не перезаписываем joined (важно для напоминаний)
     if user_id in users:
-        users[user_id]["joined"] = datetime.now().isoformat()
         users[user_id]["username"] = message.from_user.username
         if users[user_id].get("full_name") is None:
             users[user_id]["full_name"] = message.from_user.full_name
@@ -361,7 +380,7 @@ async def cmd_status(message: types.Message):
 
     # Ищем последние задачи пользователя в YouGile
     try:
-        tasks = search_tasks_by_user(user_id, limit=5)
+        tasks = await search_tasks_by_user(user_id, limit=5)
     except Exception as e:
         logger.error(f"Ошибка при поиске задач: {e}")
         # Фоллбэк — поиск в локальном логе
@@ -396,7 +415,7 @@ async def cmd_status(message: types.Message):
         column_name = "Загружается..."
         if column_id:
             try:
-                column_name = get_column_name(column_id)
+                column_name = await get_column_name(column_id)
             except Exception:
                 column_name = column_id
 
@@ -448,7 +467,7 @@ async def cmd_stats(message: types.Message):
 
     # Статистика по категориям из YouGile
     try:
-        tasks = get_tasks_for_stats()
+        tasks = await get_tasks_for_stats()
         # Группируем по колонкам
         columns = Counter()
         for task in tasks:
@@ -497,7 +516,7 @@ async def cmd_broadcast(message: types.Message, state: FSMContext):
     await message.answer(
         "📢 <b>Режим рассылки</b>\n"
         "Отправьте сообщение, которое нужно разослать всем пользователям.\n"
-        "Для отмены введите /cancel"
+        "Для отмены нажмите «❌ Отмена»."
     )
     await state.set_state(BroadcastForm.message)
 
@@ -552,7 +571,6 @@ async def process_rating(callback: types.CallbackQuery):
     rating = int(callback.data.split(":")[1])
     user_id = str(callback.from_user.id)
 
-    await update_user_field(user_id, "ratings", lambda x: x)  # placeholder
     users = await load_users()
     if user_id in users:
         if "ratings" not in users[user_id]:
@@ -651,7 +669,7 @@ async def confirm_repeat_order(message: types.Message):
         await f.write(summary + "\n\n")
 
     try:
-        task = create_task(title=f"Повторный заказ от {name}", description=summary)
+        task = await create_task(title=f"Повторный заказ от {name}", description=summary)
         await message.answer(
             f"✅ Повторный заказ принят!\n"
             f"📋 ID задачи: <code>{task.get('id', '—')}</code>",
@@ -671,8 +689,9 @@ async def confirm_repeat_order(message: types.Message):
 # ─── Фича 8: Категории услуг + обычный заказ ───────────────────────────────
 @dp.message(F.text == "🧾 Сделать заказ")
 async def start_order(message: types.Message, state: FSMContext):
-    # Проверяем рабочее время
-    await check_work_hours(message)
+    # Проверяем рабочее время — вне часов заказ не оформляем
+    if await check_work_hours(message):
+        return
 
     await state.set_state(OrderForm.category)
     await message.answer(
@@ -858,8 +877,8 @@ async def finalize_order(message: types.Message, state: FSMContext):
 
     # Создаём задачу в YouGile
     try:
-        task = create_task(
-            title=f"Заказ: {category} — {name}",
+        task = await create_task(
+            title=f"Заказ: {category} — {name} [uid:{message.from_user.id}]",
             description=summary
         )
         task_id = task.get("id", "—")
@@ -910,8 +929,8 @@ async def my_orders(message: types.Message):
         await message.answer("⚠️ Не удалось загрузить историю заказов.")
         return
 
-    # Извлекаем заказы пользователя
-    pattern = rf"(📦 <b>Новый заказ</b>.*?id: <code>{user_id}</code>\))"
+    # Извлекаем заказы пользователя (экранируем ID)
+    pattern = rf"(📦 <b>Новый заказ</b>.*?id: <code>{re.escape(user_id)}</code>\))"
     matches = re.findall(pattern, log_content, re.DOTALL)
 
     if not matches:
@@ -1041,7 +1060,7 @@ async def reminder_loop():
         except Exception as e:
             logger.error(f"❌ Ошибка в цикле напоминаний: {e}")
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(3600)  # раз в час — достаточно для проверки 180-дневного срока
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1139,9 +1158,12 @@ async def main():
         await asyncio.gather(
             dp.start_polling(bot),
             server.serve(),
+            return_exceptions=False,
         )
     except asyncio.CancelledError:
         logger.info("⚠️ Получен сигнал отмены")
+    except Exception as e:
+        logger.exception(f"❌ Критическая ошибка в main(): {e}")
     finally:
         reminder_task.cancel()
         try:
